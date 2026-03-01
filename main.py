@@ -38,7 +38,17 @@ def validate_timestamp(ts: str) -> bool:
     pattern = r"^\d{2}:\d{2}:\d{2}$"
     return bool(re.match(pattern, ts))
 
-def download_audio(video_url: str) -> tuple[str, str]:
+MIME_TYPE_MAP = {
+    "m4a": "audio/mp4",
+    "webm": "audio/webm",
+    "mp3": "audio/mpeg",
+    "mp4": "audio/mp4",
+    "ogg": "audio/ogg",
+    "wav": "audio/wav",
+    "opus": "audio/opus",
+}
+
+def download_audio(video_url: str) -> tuple[str, str, str]:
     temp_dir = tempfile.mkdtemp()
     output_template = os.path.join(temp_dir, "audio.%(ext)s")
 
@@ -47,19 +57,26 @@ def download_audio(video_url: str) -> tuple[str, str]:
         "outtmpl": output_template,
         "quiet": True,
         "noplaylist": True,
-        # No postprocessors — no FFmpeg needed
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         file_path = ydl.prepare_filename(info)
+        ext = info.get("ext", "").lower()
 
-    return file_path, temp_dir
+    mime_type = MIME_TYPE_MAP.get(ext)
+    if not mime_type:
+        raise Exception(f"Unsupported audio format: {ext}")
 
-def upload_and_wait(file_path: str):
-    uploaded_file = client.files.upload(file=file_path)
+    return file_path, temp_dir, mime_type
 
-    for _ in range(30):  # max 60 seconds
+def upload_and_wait(file_path: str, mime_type: str):
+    uploaded_file = client.files.upload(
+        file=file_path,
+        config={"mime_type": mime_type}
+    )
+
+    for _ in range(30):
         current = client.files.get(name=uploaded_file.name)
         if current.state.name == "ACTIVE":
             return current
@@ -111,12 +128,11 @@ No markdown, no explanation, no code blocks. Just the JSON."""
 
 @app.post("/ask", response_model=AskResponse)
 def ask(data: AskRequest):
-    audio_path = None
     temp_dir = None
 
     try:
-        audio_path, temp_dir = download_audio(data.video_url)
-        uploaded_file = upload_and_wait(audio_path)
+        audio_path, temp_dir, mime_type = download_audio(data.video_url)
+        uploaded_file = upload_and_wait(audio_path, mime_type)
         timestamp = find_timestamp(uploaded_file, data.topic)
 
         if not validate_timestamp(timestamp):

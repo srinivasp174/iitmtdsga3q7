@@ -1,6 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
+pydantic
+python-dotenv
 yt-dlp
 google-genai
-python-dotenv
-pydantic
