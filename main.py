@@ -1,146 +1,129 @@
 import os
 import time
 import tempfile
+import shutil
 import re
+import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import yt_dlp
 import google.genai as genai
-
-# ---------------------------------------------------
-# Load environment variables
-# ---------------------------------------------------
+from google.genai import types
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 app = FastAPI()
 
-
-# ---------------------------------------------------
-# Request & Response Models
-# ---------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class AskRequest(BaseModel):
     video_url: str
     topic: str
-
 
 class AskResponse(BaseModel):
     timestamp: str
     video_url: str
     topic: str
 
-
-# ---------------------------------------------------
-# Utility: Validate HH:MM:SS format
-# ---------------------------------------------------
-
 def validate_timestamp(ts: str) -> bool:
     pattern = r"^\d{2}:\d{2}:\d{2}$"
     return bool(re.match(pattern, ts))
 
-
-# ---------------------------------------------------
-# Step 1: Download Audio Only
-# ---------------------------------------------------
-
-def download_audio(video_url: str) -> str:
+def download_audio(video_url: str) -> tuple[str, str]:
     temp_dir = tempfile.mkdtemp()
-    output_path = os.path.join(temp_dir, "audio.%(ext)s")
+    output_template = os.path.join(temp_dir, "audio.%(ext)s")
 
     ydl_opts = {
-        "format": "bestaudio/best",   # audio only
-        "outtmpl": output_path,
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        "outtmpl": output_template,
         "quiet": True,
         "noplaylist": True,
+        # No postprocessors — no FFmpeg needed
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
         file_path = ydl.prepare_filename(info)
 
-    return file_path
-
-
-# ---------------------------------------------------
-# Step 2: Upload to Gemini Files API
-# ---------------------------------------------------
+    return file_path, temp_dir
 
 def upload_and_wait(file_path: str):
-    uploaded_file = genai.upload_file(path=file_path)
+    uploaded_file = client.files.upload(file=file_path)
 
-    # Poll until ACTIVE
-    while uploaded_file.state.name != "ACTIVE":
+    for _ in range(30):  # max 60 seconds
+        current = client.files.get(name=uploaded_file.name)
+        if current.state.name == "ACTIVE":
+            return current
+        elif current.state.name == "FAILED":
+            raise Exception("Gemini failed to process the audio file.")
         time.sleep(2)
-        uploaded_file = genai.get_file(uploaded_file.name)
 
-    return uploaded_file
-
-
-# ---------------------------------------------------
-# Step 3: Ask Gemini for Timestamp
-# ---------------------------------------------------
+    raise Exception("Timed out waiting for Gemini to process the audio file.")
 
 def find_timestamp(file, topic: str) -> str:
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    prompt = f"""Listen to this audio carefully.
 
-    response = model.generate_content(
-        [
-            file,
-            f"""
-            You are analyzing audio.
-            Find the FIRST time the topic below is spoken.
+Find the FIRST moment when the topic "{topic}" is discussed or mentioned.
 
-            Topic: "{topic}"
+Respond with ONLY a JSON object like this:
+{{"timestamp": "HH:MM:SS"}}
 
-            Return ONLY a timestamp in HH:MM:SS format.
-            Do not explain anything.
-            """
-        ],
-        generation_config={
-            "response_mime_type": "application/json",
-            "response_schema": {
-                "type": "object",
-                "properties": {
-                    "timestamp": {
-                        "type": "string",
-                        "pattern": r"^\d{2}:\d{2}:\d{2}$"
-                    }
-                },
-                "required": ["timestamp"]
-            }
-        }
+No markdown, no explanation, no code blocks. Just the JSON."""
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_uri(
+                        file_uri=file.uri,
+                        mime_type=file.mime_type,
+                    ),
+                    types.Part.from_text(text=prompt),
+                ]
+            )
+        ]
+        # No response_mime_type — causes 500 with audio input
     )
 
-    result = response.json()
+    raw = response.text.strip()
 
-    return result["timestamp"]
+    # Strip markdown code blocks if model added them anyway
+    raw = re.sub(r"^```json\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
 
+    data = json.loads(raw)
 
-# ---------------------------------------------------
-# FastAPI Endpoint
-# ---------------------------------------------------
+    if "timestamp" not in data:
+        raise Exception(f"Model did not return a timestamp. Got: {raw}")
+
+    return data["timestamp"]
 
 @app.post("/ask", response_model=AskResponse)
 def ask(data: AskRequest):
-
     audio_path = None
+    temp_dir = None
 
     try:
-        # 1. Download audio
-        audio_path = download_audio(data.video_url)
-
-        # 2. Upload and wait
+        audio_path, temp_dir = download_audio(data.video_url)
         uploaded_file = upload_and_wait(audio_path)
-
-        # 3. Ask Gemini
         timestamp = find_timestamp(uploaded_file, data.topic)
 
-        # 4. Validate format
         if not validate_timestamp(timestamp):
-            raise HTTPException(status_code=500, detail="Invalid timestamp format")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid timestamp format returned by model: {timestamp}"
+            )
 
         return AskResponse(
             timestamp=timestamp,
@@ -148,10 +131,11 @@ def ask(data: AskRequest):
             topic=data.topic
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        # 5. Cleanup temp file
-        if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
